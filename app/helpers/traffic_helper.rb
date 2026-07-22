@@ -56,7 +56,11 @@ module TrafficHelper
   end
 
   def self.cached_current_intensity
-    Rails.cache.fetch("traffic:intensity", expires_in: 60) { Keystore.value_for("traffic:intensity") || 0.5 }
+    # ApplicationController calls this on every page load, so without race_condition_ttl
+    # every request in flight when the 60s window lapses misses at once, and each one
+    # deletes the expired entry, requeries, and writes. race_condition_ttl serves the
+    # stale value to the rest while one request recomputes.
+    Rails.cache.fetch("traffic:intensity", expires_in: 60, race_condition_ttl: 5) { Keystore.value_for("traffic:intensity") || 0.5 }
   end
 
   def self.novelty_logo
