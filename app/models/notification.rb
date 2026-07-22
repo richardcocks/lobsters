@@ -17,6 +17,10 @@ class Notification < ApplicationRecord
 
   include Token
 
+  # Set by NotificationDisplayHydrator so is_high_quality? can answer from
+  # batch-loaded data instead of issuing per-notification queries.
+  attr_accessor :display_batch
+
   def should_display?
     case notifiable
     when Message
@@ -57,15 +61,24 @@ class Notification < ApplicationRecord
     comment = notifiable
     story = comment.story
     parent_comment = comment.parent_comment
-    replier_comment_ids = comment.user.comments.filter_map { |c| c.id if c.story_id == story.id }
+
+    if display_batch
+      replier_comment_ids = display_batch.replier_comment_ids(comment.user_id, story.id)
+      user_has_flagged_replier = display_batch.flagged_replier?(replier_comment_ids)
+      user_has_hidden_story = display_batch.hidden_story?(story.id)
+    else
+      replier_comment_ids = comment.user.comments.where(story_id: story.id).ids
+      user_has_flagged_replier = user.votes.where(story_id: story.id, vote: -1, comment_id: replier_comment_ids).exists?
+      user_has_hidden_story = user.hidings.where(story_id: story.id).exists?
+    end
 
     bad_properties = {
       bad_story: story.score <= story.flags,
       is_gone: comment.is_gone?,
       bad_comment: comment.score <= comment.flags,
       bad_parent_comment: parent_comment.nil? ? false : parent_comment.score <= parent_comment.flags || parent_comment.is_gone?,
-      user_has_flagged_replier: !user.votes.filter { |v| v.story_id == story.id && v.vote == -1 && replier_comment_ids.include?(v.comment_id) }.empty?,
-      user_has_hidden_story: !user.hidings.filter { |h| h.story_id == story.id }.empty?,
+      user_has_flagged_replier: user_has_flagged_replier,
+      user_has_hidden_story: user_has_hidden_story,
       user_has_filtered_tags_on_story: !(story.tags & user.tag_filter_tags).empty?
     }.compact_blank
 

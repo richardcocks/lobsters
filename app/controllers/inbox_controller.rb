@@ -21,8 +21,9 @@ class InboxController < ApplicationController
       .offset((@page - 1) * notifications_per_page)
       .limit(notifications_per_page)
       .order(created_at: :desc)
-      .preload(user: [:hidings, :votes], notifiable: {story: [:tags, :user], user: [:comments], author: [], parent_comment: []})
+      .preload(user: [], notifiable: {story: [:tags, :user], user: [], author: [], parent_comment: []})
     apply_current_vote
+    NotificationDisplayHydrator.new(@notifications, @user)
 
     @has_more = @user.notifications.count > (@page * notifications_per_page)
 
@@ -37,8 +38,9 @@ class InboxController < ApplicationController
       .notifications
       .where(read_at: nil)
       .order(created_at: :desc)
-      .preload(user: [:hidings, :votes], notifiable: {story: [:tags, :user], user: [:comments], author: [], parent_comment: []})
+      .preload(user: [], notifiable: {story: [:tags, :user], user: [], author: [], parent_comment: []})
     apply_current_vote
+    NotificationDisplayHydrator.new(@notifications, @user)
 
     respond_to do |format|
       format.html { render :all }
