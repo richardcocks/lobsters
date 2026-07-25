@@ -1,0 +1,117 @@
+# Local benchmark front proxy for compose.prod-bench.yaml. Git-excluded via
+# .git/info/exclude, like the rest of the bench harness.
+#
+# Adapted from the real prod config in hatchbox/Caddyfile.pre so the bench
+# exercises the same topology as lobste.rs: Caddy terminates TLS and serves
+# anonymous requests straight from the full-page cache without touching Puma.
+# Differences from prod, all deliberate:
+#   - Site is lobsters.localhost (browsers resolve *.localhost to loopback
+#     without a hosts-file entry) with Caddy's internal CA (`tls internal`) --
+#     the local-dev equivalent of `dotnet dev-certs`. Trust it by importing
+#     caddy-local-root.crt (exported next to this file) into the OS store.
+#   - NO Strict-Transport-Security header. Prod sends max-age=31536000; over
+#     real https the browser would honor it, and even scoped to
+#     lobsters.localhost a pin is not worth the debugging risk on a bench box.
+#   - The bot/spambot blocks are dropped; nothing scrapes localhost.
+#   - X-Lobsters-Cache marks page-cache hits (prod has this commented out) so
+#     load-test output can split cache-served from Rails-served responses.
+#
+# Port 443 in-container is published as host 3003, so the site address must be
+# :443 here while everything on the host talks to https://lobsters.localhost:3003.
+# Host is passed through to Puma, so Rails builds redirects/URLs on :3003
+# correctly (assume_ssl marks them https, which is now true).
+
+{
+	# Internal CA only; never attempt ACME for a .localhost name.
+	local_certs
+	# Port 80 is not published on the host, so the auto redirect could never be
+	# reached; disabling it stops Caddy from listening there at all.
+	auto_https disable_redirects
+	# The auto redirect wouldn't help anyway: it assumes http arrives on :80,
+	# but here http://lobsters.localhost:3003 lands as *plaintext on the TLS
+	# port* (3003 maps straight to :443), which Go's TLS server rejects with
+	# "Client sent an HTTP request to an HTTPS server." This wrapper sniffs
+	# plaintext HTTP on the TLS listener and 308s it to https on the same
+	# host:port. Must appear before the `tls` placeholder so it runs on the
+	# raw bytes, pre-handshake.
+	servers {
+		listener_wrappers {
+			http_redirect
+			tls
+		}
+	}
+}
+
+lobsters.localhost:443 {
+	tls internal
+
+	# Rails' force_ssl also emits HSTS (with preload + includeSubDomains) on
+	# every response it renders; strip it so no client ever pins a .localhost
+	# name, no matter which layer produced the response.
+	header -Strict-Transport-Security
+
+	# Mirrors the hatchbox default: root at public/, serve files that exist,
+	# proxy the rest to Rails. prod_assets and prod_page_cache volumes are
+	# mounted read-only under /srv/public in compose.prod-bench.yaml.
+	root * /srv/public
+
+	# Full-page caching with actionpack-page_caching, straight from
+	# hatchbox/Caddyfile.pre (host matcher dropped, root path adjusted).
+	@use_cached_file {
+		not { # don't serve cached when user is logged in
+			header_regexp Cookie `.*=.*`
+		}
+		not { # don't serve cached when we see a user's ?token=...
+			query token=*
+		}
+		file {
+			root /srv/public/cache
+			try_files {path}.html {path}/index.html {path}
+		}
+	}
+	rewrite @use_cached_file /cache/{file_match.relative}
+	header @use_cached_file X-Lobsters-Cache hit
+	# add CSP header when serving from cache; Rails adds when it renders pages
+	header @use_cached_file ?Content-Security-Policy "default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
+
+	# special case for the primary story rss feed, url /rss doesn't have an
+	# extension; cached on disk as rss.rss. See hatchbox/Caddyfile.pre for why
+	# this can't fold into the matcher above (an early rss.rss fill would turn
+	# /newest into /newest.rss for html clients).
+	@use_rss_cached_file {
+		not {
+			header_regexp Cookie `.*=.*`
+		}
+		path /rss
+		not {
+			query token=*
+		}
+		file {
+			root /srv/public/cache
+			try_files rss.rss
+		}
+	}
+	rewrite @use_rss_cached_file /cache/{file_match.relative}
+	header @use_rss_cached_file X-Lobsters-Cache hit
+
+	# Same-origin bridge to Grafana/Tempo for public/traceanalyzer.html. The
+	# Grafana on :3002 sends no CORS headers, so a page loaded from :3003 can't
+	# read its responses directly; route /grafana/* here, strip the prefix, and
+	# forward to the lgtm service (Grafana on container :3000) over the compose
+	# network. handle_path strips atomically, avoiding the matcher-re-eval trap.
+	handle_path /grafana/* {
+		reverse_proxy lgtm:3000
+	}
+
+	# reverse_proxy runs BEFORE file_server in Caddy's directive order, so it
+	# must be scoped to paths that don't exist on disk or static files (and the
+	# cache rewrites above) would never be served. /grafana/* is excluded so the
+	# handle_path above owns it instead of the app catch-all.
+	@not_on_disk {
+		not file
+		not path /grafana/*
+	}
+	reverse_proxy @not_on_disk prod-bench:3000
+
+	file_server
+}

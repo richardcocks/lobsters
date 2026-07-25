@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>default process — trace analyzer</title>
+<style>
+  :root{
+    --bg:#0f1116; --panel:#171a21; --panel2:#1e222b; --border:#2a2f3a;
+    --fg:#e6e9ef; --muted:#9aa3b2; --accent:#7aa2f7; --good:#7ee787;
+    --warn:#e3b341; --bad:#f7768e; --gc:#bb9af7;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:20px}
+  h1{font-size:18px;margin:0 0 2px}
+  h2{font-size:14px;margin:22px 0 8px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  .sub{color:var(--muted);font-size:12px;margin-bottom:16px}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  input,button,select{font:inherit;background:var(--panel2);color:var(--fg);
+    border:1px solid var(--border);border-radius:6px;padding:7px 10px}
+  input{min-width:180px}
+  input.trace{font-family:var(--mono);min-width:340px}
+  button{cursor:pointer;background:var(--accent);color:#0b0e14;border:none;font-weight:600}
+  button.ghost{background:var(--panel2);color:var(--fg);border:1px solid var(--border);font-weight:400}
+  button:disabled{opacity:.5;cursor:default}
+  .tabs{display:flex;gap:4px;margin-bottom:16px}
+  .tabs button{background:var(--panel2);color:var(--muted);border:1px solid var(--border);font-weight:500}
+  .tabs button.active{background:var(--accent);color:#0b0e14;border-color:var(--accent)}
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px 14px}
+  .card .k{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+  .card .v{font-size:22px;font-weight:700;margin-top:3px}
+  .card .v small{font-size:12px;font-weight:500;color:var(--muted)}
+  table{width:100%;border-collapse:collapse;margin-top:6px;background:var(--panel);
+    border:1px solid var(--border);border-radius:8px;overflow:hidden;font-size:13px}
+  th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--border)}
+  th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.03em}
+  tr:last-child td{border-bottom:none}
+  td.num,th.num{text-align:right;font-family:var(--mono)}
+  .stmt{font-family:var(--mono);font-size:12px;color:var(--muted);max-width:520px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .bar{height:6px;border-radius:3px;background:var(--accent);min-width:2px}
+  .bar.gc{background:var(--gc)}
+  .pos{color:var(--good)} .neg{color:var(--bad)} .zero{color:var(--muted)}
+  .pill{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;font-weight:600}
+  .pill.gc{background:rgba(187,154,247,.15);color:var(--gc)}
+  .pill.warn{background:rgba(227,179,65,.15);color:var(--warn)}
+  .err{color:var(--bad);margin-top:10px;font-family:var(--mono);font-size:12px;white-space:pre-wrap}
+  .muted{color:var(--muted)}
+  details{margin-top:10px}
+  summary{cursor:pointer;color:var(--muted)}
+  textarea{width:100%;min-height:90px;background:var(--panel2);color:var(--fg);
+    border:1px solid var(--border);border-radius:6px;font-family:var(--mono);font-size:12px;padding:8px}
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:720px){.split{grid-template-columns:1fr}}
+  code{font-family:var(--mono);background:var(--panel2);padding:1px 5px;border-radius:4px}
+  .recent{max-height:230px;overflow:auto}
+  .recent tr{cursor:pointer}
+  .recent tr:hover td{background:var(--panel2)}
+</style>
+</head>
+<body>
+  <h1>default&nbsp;process — trace analyzer</h1>
+  <div class="sub">Cache-refill batch traces from Tempo. Served via Caddy at
+    <code>/traceanalyzer.html</code>, talks to Grafana same-origin through <code id="base-label">/grafana</code>.</div>
+
+  <div class="tabs">
+    <button id="tab-single" class="active" onclick="setMode('single')">Single trace</button>
+    <button id="tab-compare" onclick="setMode('compare')">Compare two</button>
+  </div>
+
+  <!-- SINGLE -->
+  <div id="mode-single">
+    <div class="row">
+      <input class="trace" id="s-id" placeholder="trace id (hex)" spellcheck="false">
+      <button onclick="loadSingle()">Analyze</button>
+      <button class="ghost" onclick="listRecent('s')">Recent slow ▾</button>
+      <span class="muted" id="s-status"></span>
+    </div>
+    <details>
+      <summary>Paste raw trace JSON instead (curl <code>/api/traces/&lt;id&gt;</code>) — works with no proxy</summary>
+      <textarea id="s-paste" placeholder="paste Tempo trace JSON here"></textarea>
+      <div class="row" style="margin-top:6px"><button class="ghost" onclick="loadPaste()">Analyze pasted JSON</button></div>
+    </details>
+    <table class="recent" id="s-recent" style="display:none"></table>
+    <div id="s-out"></div>
+    <div class="err" id="s-err"></div>
+  </div>
+
+  <!-- COMPARE -->
+  <div id="mode-compare" style="display:none">
+    <div class="split">
+      <div class="row"><input class="trace" id="c-a" placeholder="trace A (baseline)" spellcheck="false">
+        <button class="ghost" onclick="listRecent('a')">Recent ▾</button></div>
+      <div class="row"><input class="trace" id="c-b" placeholder="trace B (outlier)" spellcheck="false">
+        <button class="ghost" onclick="listRecent('b')">Recent ▾</button></div>
+    </div>
+    <div class="row" style="margin-top:8px"><button onclick="loadCompare()">Compare</button>
+      <span class="muted" id="c-status"></span></div>
+    <table class="recent" id="c-recent" style="display:none"></table>
+    <div id="c-out"></div>
+    <div class="err" id="c-err"></div>
+  </div>
+
+<script>
+"use strict";
+// Base path to Grafana's Tempo datasource proxy. When served through Caddy this
+// is same-origin (/grafana strip_prefix -> lgtm:3000). Override in the URL with
+// ?base=http://localhost:3002 if you ever open this some other way.
+const PARAMS = new URLSearchParams(location.search);
+const GRAF = (PARAMS.get('base') || '/grafana').replace(/\/$/,'');
+const TEMPO = GRAF + '/api/datasources/proxy/uid/tempo';
+document.getElementById('base-label').textContent = GRAF;
+
+const ms = n => n/1e6;
+const fmt = (n,d=1) => (n==null||isNaN(n)) ? '—' : n.toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d});
+const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function setMode(m){
+  document.getElementById('mode-single').style.display  = m=='single'?'':'none';
+  document.getElementById('mode-compare').style.display = m=='compare'?'':'none';
+  document.getElementById('tab-single').classList.toggle('active', m=='single');
+  document.getElementById('tab-compare').classList.toggle('active', m=='compare');
+}
+
+async function fetchTrace(id){
+  id = id.trim();
+  if(!id) throw new Error('empty trace id');
+  const r = await fetch(`${TEMPO}/api/traces/${encodeURIComponent(id)}`);
+  if(!r.ok) throw new Error(`GET trace ${id} -> HTTP ${r.status}. Is Caddy proxying ${GRAF}? Is the id in Tempo's retention window?`);
+  return r.json();
+}
+
+async function fetchRecent(){
+  const now = Math.floor(Date.now()/1000);
+  const q = encodeURIComponent('{ rootName = "default process" }');
+  const r = await fetch(`${TEMPO}/api/search?q=${q}&start=${now-3*3600}&end=${now}&limit=100`);
+  if(!r.ok) throw new Error(`search -> HTTP ${r.status}`);
+  const j = await r.json();
+  return (j.traces||[]).map(t=>({id:t.traceID, dur:t.durationMs||0, start:Number(t.startTimeUnixNano||0)}))
+                       .sort((a,b)=>b.dur-a.dur);
+}
+
+// ---- parse OTLP-JSON trace into a flat span list + derived metrics ----------
+function attrsToObj(a){
+  const o={};
+  for(const x of (a||[])){
+    const v=x.value||{};
+    o[x.key] = v.stringValue ?? v.intValue ?? v.doubleValue ?? v.boolValue ?? v.arrayValue ?? null;
+  }
+  return o;
+}
+function parse(json){
+  const spans=[];
+  const batches = json.batches || (json.data&&json.data.batches) || [];
+  for(const b of batches)
+    for(const ss of (b.scopeSpans||b.instrumentationLibrarySpans||[]))
+      for(const s of (ss.spans||[])){
+        const st=Number(s.startTimeUnixNano), en=Number(s.endTimeUnixNano);
+        spans.push({id:s.spanId, pid:s.parentSpanId||null, name:s.name||'(unnamed)',
+                    start:st, end:en, dur:en-st, attrs:attrsToObj(s.attributes)});
+      }
+  return spans;
+}
+function analyze(json){
+  const spans = parse(json);
+  if(!spans.length) throw new Error('no spans in trace JSON');
+  const byId = new Map(spans.map(s=>[s.id,s]));
+  const kids = new Map();
+  for(const s of spans){ if(s.pid && byId.has(s.pid)){ (kids.get(s.pid)||kids.set(s.pid,[]).get(s.pid)).push(s); } }
+  // root = the span with no in-trace parent, prefer 'default process' / longest
+  const roots = spans.filter(s=>!s.pid || !byId.has(s.pid));
+  roots.sort((a,b)=> (b.name=='default process') - (a.name=='default process') || b.dur-a.dur);
+  const root = roots[0];
+  const t0 = Math.min(...spans.map(s=>s.start));
+  const t1 = Math.max(...spans.map(s=>s.end));
+
+  const self = s => Math.max(0, s.dur - (kids.get(s.id)||[]).reduce((a,c)=>a+c.dur,0));
+
+  const isGC = s => /^GC\b/i.test(s.name);
+  const gc = spans.filter(isGC).sort((a,b)=>b.dur-a.dur);
+  const gcTotal = gc.reduce((a,s)=>a+s.dur,0);
+
+  // per-request children of the root (the cache-refill fans out to N requests)
+  const reqs = (kids.get(root.id)||[]).filter(s=>/^(GET|POST|PUT|PATCH|DELETE|HEAD)\b/.test(s.name))
+              .map(s=>({name:s.name, dur:s.dur, self:self(s),
+                        sql:descendants(s,kids).filter(isSQL).length}))
+              .sort((a,b)=>b.dur-a.dur);
+
+  // aggregate every span by name: count, total, self
+  const agg = new Map();
+  for(const s of spans){
+    const a = agg.get(s.name) || {name:s.name,count:0,total:0,self:0};
+    a.count++; a.total+=s.dur; a.self+=self(s);
+    agg.set(s.name,a);
+  }
+  const byName = [...agg.values()];
+
+  // slowest SQL statements
+  const sql = spans.filter(isSQL).map(s=>({
+      dur:s.dur, stmt: s.attrs['db.statement'] || s.attrs['db.operation'] || s.name
+    })).sort((a,b)=>b.dur-a.dur);
+  const sqlTotal = sql.reduce((a,s)=>a+s.dur,0);
+
+  return {
+    root, spanCount:spans.length, wall:root?root.dur:(t1-t0), t0,
+    gc, gcTotal, gcCount:gc.length,
+    reqs, byName, sql, sqlTotal,
+    // handy scalars for compare
+    metrics:{
+      wall: root?root.dur:(t1-t0),
+      gc: gcTotal, gcCount: gc.length,
+      requests: reqs.length, spans: spans.length,
+      sql: sqlTotal, sqlCount: sql.length,
+    }
+  };
+}
+function descendants(s,kids,out=[]){ for(const c of (kids.get(s.id)||[])){ out.push(c); descendants(c,kids,out);} return out; }
+function isSQL(s){ return !!s.attrs['db.statement'] || /^(SELECT|INSERT|UPDATE|DELETE|BEGIN|COMMIT|SAVEPOINT|RELEASE|SQL\b)/i.test(s.name); }
+
+// ---- single-trace render ----------------------------------------------------
+function renderSingle(a){
+  const gcPct = a.wall? a.gcTotal/a.wall*100 : 0;
+  const maxReq = Math.max(1,...a.reqs.map(r=>r.dur));
+  const cards = [
+    ['Wall time', fmt(ms(a.wall))+' <small>ms</small>'],
+    ['Requests', a.reqs.length],
+    ['Spans', a.spanCount],
+    ['GC total', fmt(ms(a.gcTotal))+` <small>ms · ${fmt(gcPct,0)}%</small>`],
+    ['GC pauses', a.gcCount],
+    ['SQL', fmt(ms(a.sqlTotal))+` <small>ms · ${a.sql.length}</small>`],
+  ];
+  let h = `<div class="cards">`+cards.map(([k,v])=>
+    `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('')+`</div>`;
+
+  if(gcPct>=8) h += `<p><span class="pill gc">GC ${fmt(gcPct,0)}% of wall</span> `+
+    `<span class="muted">major GC likely fired here — a classic lone-outlier cause for this batch.</span></p>`;
+
+  // GC pauses
+  if(a.gc.length){
+    h += `<h2>GC pauses</h2><table><tr><th class="num">ms</th><th class="num">at t+ms</th><th>span</th></tr>`+
+      a.gc.slice(0,12).map(s=>`<tr><td class="num">${fmt(ms(s.dur))}</td>`+
+        `<td class="num">${fmt(ms(s.start-a.t0))}</td><td class="muted">${esc(s.name)}</td></tr>`).join('')+`</table>`;
+  }
+
+  // per-request breakdown
+  h += `<h2>Per-request breakdown</h2><table><tr><th>request</th><th class="num">ms</th>`+
+    `<th class="num">self</th><th class="num">sql</th><th></th></tr>`+
+    a.reqs.map(r=>`<tr><td>${esc(r.name)}</td><td class="num">${fmt(ms(r.dur))}</td>`+
+      `<td class="num">${fmt(ms(r.self))}</td><td class="num">${r.sql}</td>`+
+      `<td style="width:120px"><div class="bar" style="width:${r.dur/maxReq*100}%"></div></td></tr>`).join('')+`</table>`;
+
+  // top operations by self time
+  const ops = [...a.byName].sort((x,y)=>y.self-x.self).slice(0,14);
+  h += `<h2>Operations by self time</h2><table><tr><th>operation</th><th class="num">count</th>`+
+    `<th class="num">total ms</th><th class="num">self ms</th></tr>`+
+    ops.map(o=>`<tr><td class="${/^GC/.test(o.name)?'':''}">${/^GC/.test(o.name)?'<span class="pill gc">GC</span> ':''}${esc(o.name)}</td>`+
+      `<td class="num">${o.count}</td><td class="num">${fmt(ms(o.total))}</td>`+
+      `<td class="num">${fmt(ms(o.self))}</td></tr>`).join('')+`</table>`;
+
+  // slowest SQL
+  if(a.sql.length){
+    h += `<h2>Slowest SQL</h2><table><tr><th class="num">ms</th><th>statement</th></tr>`+
+      a.sql.slice(0,10).map(s=>`<tr><td class="num">${fmt(ms(s.dur))}</td>`+
+        `<td class="stmt" title="${esc(s.stmt)}">${esc(s.stmt)}</td></tr>`).join('')+`</table>`;
+  }
+  return h;
+}
+
+// ---- compare render ---------------------------------------------------------
+function delta(av,bv,unitMs=true){
+  const d = bv-av;
+  const cls = Math.abs(d)<1e-9?'zero':(d>0?'neg':'pos'); // slower(B>A)=bad
+  const val = unitMs?fmt(ms(d)):fmt(d,0);
+  return `<span class="${cls}">${d>0?'+':''}${val}</span>`;
+}
+function renderCompare(A,B){
+  const rows = [
+    ['Wall (ms)', A.metrics.wall, B.metrics.wall, true],
+    ['GC total (ms)', A.metrics.gc, B.metrics.gc, true],
+    ['GC pauses', A.metrics.gcCount, B.metrics.gcCount, false],
+    ['SQL total (ms)', A.metrics.sql, B.metrics.sql, true],
+    ['SQL queries', A.metrics.sqlCount, B.metrics.sqlCount, false],
+    ['Requests', A.metrics.requests, B.metrics.requests, false],
+    ['Spans', A.metrics.spans, B.metrics.spans, false],
+  ];
+  let h = `<h2>Overview — A (baseline) vs B</h2><table><tr><th>metric</th><th class="num">A</th>`+
+    `<th class="num">B</th><th class="num">Δ (B−A)</th></tr>`+
+    rows.map(([k,av,bv,u])=>`<tr><td>${k}</td><td class="num">${u?fmt(ms(av)):av}</td>`+
+      `<td class="num">${u?fmt(ms(bv)):bv}</td><td class="num">${delta(av,bv,u)}</td></tr>`).join('')+`</table>`;
+
+  // wall delta attribution: GC vs everything else
+  const wallD = B.metrics.wall-A.metrics.wall, gcD = B.metrics.gc-A.metrics.gc;
+  if(Math.abs(wallD)>1e6){
+    const gcShare = wallD!==0 ? gcD/wallD*100 : 0;
+    h += `<p class="muted">B is ${fmt(ms(wallD))} ms ${wallD>0?'slower':'faster'}; `+
+      `GC accounts for ${fmt(ms(gcD))} ms (${fmt(gcShare,0)}% of the difference).</p>`;
+  }
+
+  // operation self-time join, biggest movers
+  const names = new Set([...A.byName.map(x=>x.name),...B.byName.map(x=>x.name)]);
+  const am = new Map(A.byName.map(x=>[x.name,x])), bm = new Map(B.byName.map(x=>[x.name,x]));
+  const movers = [...names].map(n=>{
+    const as=(am.get(n)||{self:0,count:0}).self, bs=(bm.get(n)||{self:0,count:0}).self;
+    return {name:n, as, bs, d:bs-as};
+  }).sort((x,y)=>Math.abs(y.d)-Math.abs(x.d)).slice(0,16);
+  h += `<h2>Biggest movers (self ms)</h2><table><tr><th>operation</th><th class="num">A</th>`+
+    `<th class="num">B</th><th class="num">Δ</th></tr>`+
+    movers.map(m=>`<tr><td>${/^GC/.test(m.name)?'<span class="pill gc">GC</span> ':''}${esc(m.name)}</td>`+
+      `<td class="num">${fmt(ms(m.as))}</td><td class="num">${fmt(ms(m.bs))}</td>`+
+      `<td class="num">${delta(m.as,m.bs)}</td></tr>`).join('')+`</table>`;
+
+  // per-request path join
+  const rn = new Set([...A.reqs.map(r=>r.name),...B.reqs.map(r=>r.name)]);
+  const ar = new Map(A.reqs.map(r=>[r.name,r])), br = new Map(B.reqs.map(r=>[r.name,r]));
+  const reqRows = [...rn].map(n=>{
+    const ad=(ar.get(n)||{dur:0}).dur, bd=(br.get(n)||{dur:0}).dur;
+    return {name:n, ad, bd, d:bd-ad};
+  }).sort((x,y)=>Math.abs(y.d)-Math.abs(x.d));
+  h += `<h2>Per-request (ms)</h2><table><tr><th>request</th><th class="num">A</th>`+
+    `<th class="num">B</th><th class="num">Δ</th></tr>`+
+    reqRows.map(r=>`<tr><td>${esc(r.name)}</td><td class="num">${r.ad?fmt(ms(r.ad)):'—'}</td>`+
+      `<td class="num">${r.bd?fmt(ms(r.bd)):'—'}</td><td class="num">${delta(r.ad,r.bd)}</td></tr>`).join('')+`</table>`;
+  return h;
+}
+
+// ---- wiring -----------------------------------------------------------------
+async function loadSingle(){
+  const id=document.getElementById('s-id').value;
+  const err=document.getElementById('s-err'), out=document.getElementById('s-out'),
+        st=document.getElementById('s-status');
+  err.textContent=''; st.textContent='loading…';
+  try{ const a=analyze(await fetchTrace(id)); out.innerHTML=renderSingle(a);
+       st.textContent=`root: ${a.root?esc(a.root.name):'?'}`; }
+  catch(e){ st.textContent=''; out.innerHTML=''; err.textContent=e.message; }
+}
+function loadPaste(){
+  const err=document.getElementById('s-err'), out=document.getElementById('s-out');
+  err.textContent='';
+  try{ out.innerHTML=renderSingle(analyze(JSON.parse(document.getElementById('s-paste').value))); }
+  catch(e){ out.innerHTML=''; err.textContent=e.message; }
+}
+async function loadCompare(){
+  const err=document.getElementById('c-err'), out=document.getElementById('c-out'),
+        st=document.getElementById('c-status');
+  err.textContent=''; st.textContent='loading…';
+  try{
+    const [ja,jb]=await Promise.all([fetchTrace(document.getElementById('c-a').value),
+                                     fetchTrace(document.getElementById('c-b').value)]);
+    out.innerHTML=renderCompare(analyze(ja),analyze(jb)); st.textContent='';
+  }catch(e){ st.textContent=''; out.innerHTML=''; err.textContent=e.message; }
+}
+async function listRecent(which){
+  const tblId = which=='s'?'s-recent':'c-recent';
+  const tbl=document.getElementById(tblId);
+  const errId = which=='s'?'s-err':'c-err';
+  document.getElementById(errId).textContent='';
+  try{
+    const list=await fetchRecent();
+    tbl.style.display='';
+    tbl.innerHTML=`<tr><th class="num">ms</th><th>trace id</th></tr>`+
+      list.map(t=>`<tr data-id="${t.id}" data-w="${which}"><td class="num">${fmt(t.dur,0)}</td>`+
+        `<td class="stmt">${t.id}</td></tr>`).join('');
+    tbl.querySelectorAll('tr[data-id]').forEach(tr=>tr.onclick=()=>{
+      const id=tr.getAttribute('data-id');
+      if(which=='s'){document.getElementById('s-id').value=id; loadSingle();}
+      else if(which=='a'){document.getElementById('c-a').value=id;}
+      else {document.getElementById('c-b').value=id;}
+      tbl.style.display='none';
+    });
+  }catch(e){ document.getElementById(errId).textContent=e.message; }
+}
+
+// deep-link: ?trace=<id>  or  ?a=<id>&b=<id>
+if(PARAMS.get('trace')){ document.getElementById('s-id').value=PARAMS.get('trace'); loadSingle(); }
+if(PARAMS.get('a')&&PARAMS.get('b')){ setMode('compare');
+  document.getElementById('c-a').value=PARAMS.get('a');
+  document.getElementById('c-b').value=PARAMS.get('b'); loadCompare(); }
+</script>
+</body>
+</html>
