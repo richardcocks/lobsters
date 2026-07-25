@@ -119,6 +119,12 @@ services:
       # middleware.rb). This is ~30 extra spans per request, hence the queue
       # sizing below; set to 0 for lean runs where only the app matters.
       BENCH_OTEL_MIDDLEWARE: "1"
+      # Floor for a middleware phase span, in ms. Runs of consecutive layers
+      # below it merge into one "middleware xN (request)" row, so the waterfall
+      # keeps its shape without the ~50-bar lead-in and lead-out of microsecond
+      # layers; anything at or above it still gets its own row. Per-layer numbers
+      # are unaffected in metrics. 0 disables the merging.
+      BENCH_OTEL_MIDDLEWARE_MIN_MS: "0.5"
       # The BatchSpanProcessor defaults (queue 2048, batch 512) silently DROP
       # spans once middleware instrumentation multiplies volume ~5x -- an earlier
       # run produced n=31 traces and a nonsense p50 of 34s because whole traces
