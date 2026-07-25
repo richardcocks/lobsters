@@ -1,0 +1,35 @@
+# Bench-only Gemfile. Inherits the real one and adds OpenTelemetry on top, so
+# the tracked Gemfile / Gemfile.lock stay untouched -- nothing here can leak into
+# a commit or a deploy. Selected via BUNDLE_GEMFILE in compose.prod-bench.yaml.
+# Excluded from git via .git/info/exclude, alongside compose.prod-bench.yaml.
+#
+# Regenerate the lock after changing this. --conservative is NOT optional: a bare
+# `bundle lock` re-resolves the inherited Gemfile from scratch and will happily
+# drag the whole app forward (it silently moved a bench run to Rails 8.1.3 /
+# solid_cache 1.0.10 once, invalidating a day of measurements). Seed from the
+# real lock first so only the new gems are resolved:
+#   podman exec lobsters-prod-bench bash -lc \
+#     'cd /lobsters && cp Gemfile.lock Gemfile.bench.lock &&
+#      BUNDLE_GEMFILE=Gemfile.bench bundle lock --conservative'
+# Then confirm: `grep -E "^    (rails|solid_cache) " Gemfile.bench.lock`
+eval_gemfile "Gemfile"
+
+# opentelemetry-instrumentation-rails pulls in the action_pack, action_view and
+# active_record instrumentations, which subscribe to the same
+# ActiveSupport::Notifications events (process_action.action_controller,
+# render_template.action_view, sql.active_record, ...) that the hand-rolled
+# tracer in config/initializers/production.rb was reading -- but emit them as
+# proper nested OTLP spans instead of a flat JSONL file.
+gem "opentelemetry-sdk"
+gem "opentelemetry-exporter-otlp"
+gem "opentelemetry-instrumentation-rails"
+
+# Metrics and logs ship as separate, still-pre-1.0 gems (the OTel Ruby SIG
+# stabilised tracing first). The signal APIs are independent of the trace API, so
+# these do not disturb the tracing above; they do mean the metrics/logs code has
+# to be written against whatever the installed version exposes rather than the
+# published spec, hence the introspection in lib/bench_otel/.
+gem "opentelemetry-metrics-sdk"
+gem "opentelemetry-exporter-otlp-metrics"
+gem "opentelemetry-logs-sdk"
+gem "opentelemetry-exporter-otlp-logs"

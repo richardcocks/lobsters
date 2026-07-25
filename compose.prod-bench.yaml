@@ -1,0 +1,200 @@
+# Local-only benchmark harness: runs the app in production mode so we can measure
+# real-world performance against the dev-mode numbers. Not part of the app;
+# excluded via .git/info/exclude.
+#
+# Everything the app *writes* lives on podman volumes rather than the /lobsters
+# bind mount, because that bind mount is drvfs across the WSL2 boundary (~30x
+# slower for small writes) and would otherwise pollute every measurement:
+#   storage/      - prod SQLite files (primary, queue, rack_attack); the cache
+#                   DB moved to a tmpfs mount (/var/cache/lobsters-db) to take
+#                   WAL checkpoint flushes out of the request path
+#   public/assets - precompiled assets (also keeps them out of the working tree)
+#   public/cache  - caches_page output, written on EVERY request in production
+#
+# Host ports: 3001 = Puma direct (http), 3002 = Grafana, 3003 = Caddy (https).
+# The caddy service replicates prod's real topology (lobste.rs runs behind
+# Caddy, see hatchbox/Caddyfile.pre): TLS termination via its internal CA at
+# https://lobsters.localhost:3003, and anonymous requests served straight from
+# the full-page cache without touching Puma. With TLS real again, force_ssl/
+# assume_ssl stay on exactly as prod; going direct to http://localhost:3001
+# still works for anonymous load tests, but login there breaks (redirect_to
+# expands to https:// and the session cookie is `secure`) -- log in through
+# Caddy, or flip BENCH_NO_SSL to 1 if a run needs authed http on 3001.
+
+services:
+  prod-bench:
+    image: localhost/lobsters-dev:latest
+    container_name: lobsters-prod-bench
+    working_dir: /lobsters
+    # precompile is a no-op once the manifest is current, so restarts stay fast
+    # The pidfile is cleared first: `podman restart` SIGKILLs Puma before it can
+    # clean up, and a stale file holding "pid: 1" always looks live in a fresh
+    # container (PID 1 exists by definition), so Puma refuses to boot.
+    # bundle install is idempotent and only has to fetch the ~15 OTel gems on top
+    # of what the image already has at /usr/local/bundle -- which is the container
+    # layer, so it is lost on every recreate and must be re-run here.
+    # $$PIDFILE, not $PIDFILE: compose performs its own variable substitution on
+    # this string before the container ever sees it. PIDFILE is set in the
+    # container's environment, not the host's, so a single $ expanded to the empty
+    # string and shipped `rm -f  && ...` -- which exits 0, so the chain continued
+    # and the guard silently did nothing. That stayed invisible while we only ever
+    # ran `compose up` (a fresh container has an empty /tmp), and broke the moment
+    # something used `podman restart`, which keeps the container layer: the stale
+    # file still said "pid: 1", PID 1 always exists, and Puma exited 1 with
+    # "A server is already running". $$ escapes the substitution.
+    # db:prepare recreates the cache schema on the empty tmpfs mount each boot
+    # (idempotent no-op for primary/queue, which persist on the volume).
+    command: ["bash", "-lc", "rm -f $$PIDFILE && bundle install --quiet && bin/rails assets:precompile && bin/rails db:prepare && exec bin/rails server -b 0.0.0.0 -p 3000"]
+    # SolidCache on tmpfs: WAL autocheckpoint flushes were the 15-47ms commit
+    # stalls in Tempo (repro: tmp/cache_contention_test.rb). Cache is
+    # disposable, so RAM-backed is safe; database.yml points cache there.
+    tmpfs:
+      - /var/cache/lobsters-db:size=256m
+    ports:
+      - "3001:3000"
+    environment:
+      RAILS_ENV: production
+      # Throwaway value for a local benchmark container that holds no real data
+      # and is never exposed. Not a credential.
+      SECRET_KEY_BASE: benchmarkonlynotasecret0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+      RAILS_LOG_TO_STDOUT: "1"
+      # production.rb gates public_file_server on this being present
+      RAILS_SERVE_STATIC_FILES: "1"
+      # config/puma.rb defaults the prod pidfile to the Hatchbox deploy path
+      # (/home/deploy/lobsters/shared/tmp/pids) which does not exist here
+      # Deliberately /tmp (container layer) rather than tmp/ (the bind mount), so
+      # it cannot outlive the container it describes.
+      PIDFILE: /tmp/puma-prod-bench.pid
+      # and defaults workers to Etc.nprocessors (16), which would preload 16
+      # copies of Rails into a 2GiB podman machine. Two is enough to exercise
+      # real cross-process contention on the SQLite write lock.
+      PUMA_WORKERS: "2"
+      # Rack::Attack's 10-minute throttle (limit 100) otherwise 429s any load
+      # test after ~100 requests, from middleware, before a controller runs.
+      # Read by the gitignored config/initializers/production.rb.
+      BENCH_NO_THROTTLE: "1"
+      # 1 disables force_ssl/assume_ssl (read by the gitignored
+      # config/initializers/production.rb) for http login directly on :3001.
+      # Off by default now that the caddy service provides real TLS.
+      BENCH_NO_SSL: "0"
+      # Hand-rolled per-middleware JSONL waterfall. Superseded by OTel below, but
+      # kept as an independent cross-check; set to 1 to re-enable.
+      BENCH_PROFILE_MIDDLEWARE: "0"
+      # Run the SolidQueue supervisor inside Puma (config/puma.rb gates the
+      # plugin on this) so the every-2-minute PrefillPageCacheJob keeps the
+      # full-page cache warm, matching prod's cache behavior (#2159). Without
+      # it no recurring jobs fire and the cache only fills on anonymous misses.
+      SOLID_QUEUE_IN_PUMA: "1"
+      # ...but swap the production recurring schedule for a bench-only one
+      # containing ONLY prefill_page_cache. The real schedule would run jobs
+      # that reach outside the container (FetchEmailBlocklistJob hits GitHub,
+      # FetchIanaTldsJob hits IANA) and timer-driven cache fills
+      # (traffic_helper, flagged commenters) that grab the SQLite write lock
+      # mid-measurement. Path is relative to Rails.root; file is git-excluded.
+      # NOTE: queued perform_later jobs (webmentions, notifications) from past
+      # sessions WILL drain when the supervisor first starts -- this only
+      # replaces the recurring schedule, not the worker.
+      SOLID_QUEUE_RECURRING_SCHEDULE: config/recurring.bench.yml
+
+      # --- OpenTelemetry -> LGTM ---------------------------------------------
+      # Selects the bench-only Gemfile, which inherits the tracked one and adds
+      # the OTel gems on top. Keeps Gemfile/Gemfile.lock out of the diff.
+      BUNDLE_GEMFILE: /lobsters/Gemfile.bench
+      BENCH_OTEL: "1"
+      OTEL_SERVICE_NAME: lobsters
+      # HTTP/protobuf on 4318 rather than gRPC on 4317: one less moving part, and
+      # the payloads here are small enough that the difference does not matter.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://lgtm:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: otlp
+      OTEL_LOGS_EXPORTER: otlp
+      # Trace every request. This is a benchmark box, not production -- sampling
+      # would defeat the purpose when chasing a p95 tail.
+      OTEL_TRACES_SAMPLER: always_on
+      # Flush every second so traces show up in Grafana while you are still
+      # looking at the terminal. Default is 5s.
+      OTEL_BSP_SCHEDULE_DELAY: "1000"
+      # Per-middleware spans with a correct self/downstream split (lib/bench_otel/
+      # middleware.rb). This is ~30 extra spans per request, hence the queue
+      # sizing below; set to 0 for lean runs where only the app matters.
+      BENCH_OTEL_MIDDLEWARE: "1"
+      # The BatchSpanProcessor defaults (queue 2048, batch 512) silently DROP
+      # spans once middleware instrumentation multiplies volume ~5x -- an earlier
+      # run produced n=31 traces and a nonsense p50 of 34s because whole traces
+      # arrived in fragments. Dropped spans do not error; they just quietly
+      # corrupt the analysis, so these are sized well past what a bench run needs.
+      OTEL_BSP_MAX_QUEUE_SIZE: "16384"
+      OTEL_BSP_MAX_EXPORT_BATCH_SIZE: "2048"
+      # Metrics are aggregated in-process and pushed on this interval (see
+      # lib/bench_otel/metrics.rb); 5s keeps a 90-second bench run legible
+      # instead of collapsing it into one or two points.
+      BENCH_METRIC_INTERVAL_MS: "5000"
+      # Requests to exactly this path get a wall-mode stackprof capture (see
+      # lib/bench_otel/profile_probe.rb): pushed to Pyroscope tagged with the
+      # request's trace id, plus a raw .dump/.meta.json pair (container-local
+      # /tmp/profiles) for offline span-aligned analysis. Empty disables the
+      # probe entirely. NOTE the observer effect: profiled requests report
+      # inflated absolute times (the sampler tax scales with stack depth, so
+      # render suffers ~3x at 100us). Profile for attribution, not timing --
+      # keep this empty during measurement runs.
+      BENCH_PROFILE_PATH: ""
+      # The otel-lgtm image bundles Pyroscope on its internal :4040 with the
+      # Grafana datasource already provisioned, so no extra service is needed.
+      BENCH_PYROSCOPE_URL: http://lgtm:4040
+      # info keeps Loki volume down, at the cost of per-request detail: lobsters
+      # emits almost nothing at :info during a request, so shipped lines are
+      # mostly boot/warn/error. Set to debug when the SQL and cache lines are
+      # wanted -- a SolidCache DELETE sitting inside a slow trace is what the
+      # log/trace correlation is for.
+      BENCH_OTEL_LOG_LEVEL: info
+    depends_on:
+      - lgtm
+    volumes:
+      - .:/lobsters
+      - prod_storage:/lobsters/storage
+      - prod_assets:/lobsters/public/assets
+      - prod_page_cache:/lobsters/public/cache
+
+  # Prod-shaped front proxy: TLS + full-page-cache serving (see Caddyfile.bench).
+  # /data persists on a volume so the internal CA (and therefore the root cert
+  # the host trusts) survives recreates.
+  caddy:
+    image: docker.io/library/caddy:2
+    container_name: lobsters-caddy
+    ports:
+      - "3003:443"
+    volumes:
+      - ./Caddyfile.bench:/etc/caddy/Caddyfile:ro
+      - ./public:/srv/public:ro
+      - prod_assets:/srv/public/assets:ro
+      - prod_page_cache:/srv/public/cache:ro
+      - caddy_data:/data
+    depends_on:
+      - prod-bench
+
+  # All-in-one Grafana + Tempo (traces) + Prometheus (metrics) + Loki (logs),
+  # with an OTLP collector in front. Grafana is on host port 3002 because
+  # lobsters-dev owns 3000 and prod-bench owns 3001.
+  lgtm:
+    image: docker.io/grafana/otel-lgtm:latest
+    container_name: lobsters-lgtm
+    ports:
+      - "3002:3000"
+      - "4317:4317"
+      - "4318:4318"
+    environment:
+      # Local-only, no data worth protecting: skip the login form entirely so
+      # the Grafana link works without an admin/admin dance.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - lgtm_data:/data
+
+volumes:
+  caddy_data:
+  prod_storage:
+  prod_assets:
+  prod_page_cache:
+  lgtm_data:

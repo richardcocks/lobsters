@@ -1,0 +1,49 @@
+# TRACKED REFERENCE COPY -- not loaded by Rails (no .rb extension).
+#
+# The live file is config/initializers/production.rb, which is gitignored by
+# upstream's own .gitignore ("prod config" section, line 44). That is deliberate:
+# an ignored file can never conflict on an upstream merge. But ignored also means
+# unprotected -- lib/bench_otel/ was lost exactly that way and only survived in a
+# stray quarantine commit -- so this copy exists purely as the backup.
+#
+# To restore the live wiring after a fresh clone:
+#   cp config/initializers/production.rb.bench-example \
+#      config/initializers/production.rb
+#
+# Keep the two in sync when you change the live file.
+# ---------------------------------------------------------------------------
+
+# Local benchmark escape hatch. This filename is gitignored (see .gitignore
+# "prod config" section), so it is never committed or deployed.
+#
+# Rack::Attack's "rate 10 minutes" throttle (limit 100) rate-limits any load test
+# run from a single IP, returning 429s from middleware before a controller is
+# reached. That silently turns a benchmark into a measurement of how fast Rack
+# rejects requests. compose.prod-bench.yaml sets BENCH_NO_THROTTLE=1 to opt out.
+#
+# Gated on an env var that nothing else sets, so this is a no-op in the dev
+# container and anywhere else.
+if ENV["BENCH_NO_THROTTLE"] == "1"
+  Rails.logger.warn "BENCH_NO_THROTTLE=1: Rack::Attack throttles bypassed (benchmark mode)"
+  Rack::Attack.safelist("benchmark-mode") { |_request| true }
+end
+
+# force_ssl + assume_ssl break login over plain http: assume_ssl marks every
+# request as https, so the post-login `redirect_to "/"` expands to an absolute
+# https://localhost:3001/ Location (nothing speaks TLS there), and the session
+# cookie is stamped `secure` so strict clients drop it. Both off for the bench.
+# Initializers run before the middleware stack is built, so flipping the config
+# here really does remove ActionDispatch::SSL / AssumeSSL from the stack.
+if ENV["BENCH_NO_SSL"] == "1"
+  Rails.logger.warn "BENCH_NO_SSL=1: force_ssl and assume_ssl disabled (benchmark mode)"
+  Rails.application.config.force_ssl = false
+  Rails.application.config.assume_ssl = false
+end
+
+# The OpenTelemetry harness (traces + metrics + logs) lives in lib/bench_otel.rb
+# so that it is tracked in git and reviewable. Only the wiring is here, in the
+# ignored file, which keeps upstream merges from ever conflicting on it.
+if ENV["BENCH_OTEL"] == "1"
+  require Rails.root.join("lib/bench_otel").to_s
+  BenchOtel.install!
+end

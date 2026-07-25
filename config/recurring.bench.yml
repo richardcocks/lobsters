@@ -1,0 +1,11 @@
+# Bench-only SolidQueue recurring schedule (see compose.prod-bench.yaml, which
+# points SOLID_QUEUE_RECURRING_SCHEDULE here). Replaces config/recurring.yml so
+# the prod-bench container gets the full-page cache warmer without the rest of
+# the production schedule: no outbound fetches (email blocklist, IANA TLDs), no
+# timer-driven cache fills (traffic_helper every 5m, flagged commenters every
+# 15m) contending on the SQLite write lock mid-measurement, and no sitemap job
+# writing into the public/ bind mount. Git-excluded via .git/info/exclude.
+production:
+  prefill_page_cache:
+    class: PrefillPageCacheJob
+    schedule: every 2 minutes
