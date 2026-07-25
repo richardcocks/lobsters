@@ -85,8 +85,34 @@ module BenchOtel
   # Known limitation: a middleware that returns a streaming/lazy body finishes
   # its `call` before the body is written, so body-generation time lands on
   # whoever consumes it rather than on the layer that produced it.
+  #
+  # ---------------------------------------------------------------------------
+  # Collapsing the uninteresting layers
+  #
+  # A stock stack is ~30 layers, so the flat layout costs ~60 spans per request
+  # and the waterfall opens with a long lead-in (and closes with a long lead-out)
+  # of microsecond bars nobody reads. BENCH_OTEL_MIDDLEWARE_MIN_MS sets a floor:
+  # any phase span shorter than it is merged with its immediate neighbours into
+  # one span covering the run, and layers at or above the floor still get their
+  # own row. Collapsing runs rather than dropping the small spans outright keeps
+  # the timeline continuous -- the lead-in is still visibly 8ms wide -- and a
+  # slow layer in the middle splits the run in two instead of being buried:
+  #
+  #     middleware x1 (request)                 0.01ms
+  #     middleware Rack::MiniProfiler (request) 5.88ms
+  #     middleware x3 (request)                 0.02ms
+  #     middleware ActionDispatch::Static (req) 1.63ms
+  #     middleware x24 (request)                0.68ms
+  #
+  # Merging needs every phase span of a request in hand (a kept span has to break
+  # the run around it), so with a floor set the spans are buffered in env and
+  # written by the outermost proxy on its way out. They carry explicit timestamps
+  # already, so nothing about them changes but the grouping -- and per-layer
+  # numbers are unaffected in metrics, which still records every layer
+  # individually regardless of this setting.
   module Middleware
     STACK_KEY = "bench_otel.mw_stack"
+    BUFFER_KEY = "bench_otel.mw_spans"
 
     # Layers we do not wrap. Rack::Events is OTel's own plumbing: it attaches
     # the root span's context in on_start and detaches in on_finish (which fires
@@ -169,7 +195,12 @@ module BenchOtel
             @middleware.call(env)
           ensure
             attrs = close_frame(stack, parent, frame, t0)
-            emit_phase_spans(frame, time0, attrs)
+            emit_phase_spans(env, frame, time0, attrs)
+            # An empty stack means this is the outermost proxy, so every phase
+            # span of the request is now buffered and the root span is still the
+            # current context. The AppMarker is the innermost layer and so never
+            # reaches this branch with an empty stack.
+            Middleware.flush(env) if stack.empty?
           end
         end
       end
@@ -209,22 +240,33 @@ module BenchOtel
       # Detached spans, emitted after the fact with explicit timestamps and
       # never attached as current context, so they parent to whatever is
       # current -- the root request span -- instead of each other.
-      def emit_phase_spans(frame, time0, attrs)
-        tracer = BenchOtel.tracer
+      def emit_phase_spans(env, frame, time0, attrs)
         time3 = Time.now
 
         if frame.first_down_time.nil?
-          tracer.start_span(@span_name, attributes: attrs, start_timestamp: time0)
-            .finish(end_timestamp: time3)
+          record(env, @span_name, attrs, time0, time3, attrs["mw.total_ms"], nil)
         else
-          tracer.start_span("#{@span_name} (request)",
-            attributes: attrs.merge("mw.phase" => "request"),
-            start_timestamp: time0)
-            .finish(end_timestamp: frame.first_down_time)
-          tracer.start_span("#{@span_name} (response)",
-            attributes: {"mw.name" => @name, "mw.phase" => "response", "mw.out_ms" => attrs["mw.out_ms"]},
-            start_timestamp: frame.last_return_time)
-            .finish(end_timestamp: time3)
+          record(env, "#{@span_name} (request)",
+            attrs.merge("mw.phase" => "request"),
+            time0, frame.first_down_time, attrs["mw.in_ms"], "request")
+          record(env, "#{@span_name} (response)",
+            {"mw.name" => @name, "mw.phase" => "response", "mw.out_ms" => attrs["mw.out_ms"]},
+            frame.last_return_time, time3, attrs["mw.out_ms"], "response")
+        end
+      end
+
+      # With no floor configured the span goes straight out, exactly as before.
+      # Otherwise it is buffered for Middleware.flush, which needs the whole
+      # request's worth to decide what merges with what.
+      def record(env, name, attributes, start, finish, ms, phase)
+        if Middleware.collapse_ms.zero?
+          BenchOtel.tracer.start_span(name, attributes: attributes, start_timestamp: start)
+            .finish(end_timestamp: finish)
+        else
+          (env[BUFFER_KEY] ||= []) << {
+            name: name, attributes: attributes, start: start, finish: finish,
+            phase: phase, keep: ms >= Middleware.collapse_ms
+          }
         end
       end
 
@@ -233,8 +275,41 @@ module BenchOtel
     end
 
     class << self
+      # Phase spans shorter than this (ms) are merged with their neighbours.
+      # 0 -- the default -- keeps every layer on its own row.
+      attr_reader :collapse_ms
+
+      # Writes out one request's buffered phase spans, merging each run of
+      # consecutive sub-floor spans into a single row. Start order, not
+      # completion order: the buffer fills innermost-first for the response
+      # phase, which is the reverse of how the trace reads.
+      def flush(env)
+        pending = env.delete(BUFFER_KEY)
+        return unless pending&.any?
+
+        pending.sort_by! { |s| s[:start] }
+        run = []
+        pending.each do |s|
+          # A kept span, or a phase change, ends whatever run is open: merging
+          # across either would produce a bar that overlaps a row it is not part
+          # of, which is the sort of lie this file exists to avoid.
+          if s[:keep] || (run.any? && run.last[:phase] != s[:phase])
+            emit_run(run)
+            run = []
+          end
+          if s[:keep]
+            emit(s[:name], s[:attributes], s[:start], s[:finish])
+          else
+            run << s
+          end
+        end
+        emit_run(run)
+      end
+
       def install!
         return unless ENV["BENCH_OTEL_MIDDLEWARE"] == "1"
+
+        @collapse_ms = ENV.fetch("BENCH_OTEL_MIDDLEWARE_MIN_MS", "0").to_f
 
         # Swap in our proxy at the point Rails builds the stack. Patching
         # build_instrumented rather than InstrumentationProxy#call keeps the
@@ -257,7 +332,41 @@ module BenchOtel
         # Appended, so it is the innermost layer -- below even Rack::Attack.
         Rails.application.config.middleware.use AppMarker
 
-        BenchOtel.warn_log "BENCH_OTEL_MIDDLEWARE=1: per-layer spans with self/downstream split"
+        BenchOtel.warn_log "BENCH_OTEL_MIDDLEWARE=1: per-layer spans with self/downstream split" \
+          "#{" (collapsing layers under #{@collapse_ms}ms)" if @collapse_ms > 0}"
+      end
+
+      private
+
+      # One row for a run of sub-floor layers. A run of one is left as itself:
+      # the layer's name says more than a count of 1 does, and it costs nothing.
+      def emit_run(run)
+        return if run.empty?
+        return emit(run.first[:name], run.first[:attributes], run.first[:start], run.first[:finish]) if run.one?
+
+        phase = run.first[:phase]
+        # Every span in a run shares a phase, so one attribute holds the figure
+        # the merged bar is made of. A short-circuiting layer has no phase and
+        # its whole call is own work.
+        key = {"request" => "mw.in_ms", "response" => "mw.out_ms"}.fetch(phase, "mw.total_ms")
+        emit(
+          "middleware x#{run.size}#{" (#{phase})" if phase}",
+          {
+            "mw.collapsed" => run.size,
+            "mw.phase" => phase || "full",
+            # Own work only -- the merged span covers no downstream time, so this
+            # is the whole cost of the run, and comparing it to the bar's length
+            # shows what the layers cost versus what the handoffs between them do.
+            "mw.self_ms" => run.sum { |s| s[:attributes][key] }.round(2),
+            "mw.names" => run.map { |s| s[:attributes]["mw.name"] }.join(", ")
+          },
+          run.first[:start], run.last[:finish]
+        )
+      end
+
+      def emit(name, attributes, start, finish)
+        BenchOtel.tracer.start_span(name, attributes: attributes, start_timestamp: start)
+          .finish(end_timestamp: finish)
       end
     end
   end
